@@ -1,0 +1,293 @@
+---
+title: "Routines for Logit, Probit, and Tobit"
+author: "Miles D. Williams"
+date: "June 14, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = T,
+                      message = F,
+                      warning = F)
+```
+
+In this file, I write routines for logit, probit, and Tobit models. Functionality for each of these estimators already exists in R, but I wanted to write my own routines as an analytic exercise. 
+
+I begin with logit...
+
+### The logit model
+The logit model is a generalized linear regression model typically used when the outcome variable is a binary outcome (e.g., it takes values of either 0 or 1). Unlike least squares regression, logit fits a linear predictor to a logistic curve. The goal is to estimate parameter values for model predictors such that the likelihood of the data is maximized. That is, given an outcome variable and a set of predictor variables, what parameters maximize the probability of observing this set of outcomes given this set of predictors.
+
+The likelihood function for the logit model is given as
+$$L_\text{logit} = \prod_i p_i^{y_i}(1 - p_i)^{1-y_i}$$
+where $p_i$ denotes the probability of observing $y_i = 1$. For a logit model, the probability is equivalent to
+$$p_i \equiv \frac{\exp(\mathbf{X}\boldsymbol{\beta})}{\exp(\mathbf{X}\boldsymbol{\beta}) + 1}.$$
+$\mathbf{X}$ is a $n \times k+1$ matrix of $k$ covariates (plus 1 constant) where $\boldsymbol{\beta}$ is a $k +1 \times 1$ matrix of slope (and 1 intercept) parameters to be estimated. The value of these parameters has a relatively straightforward interpretation, which can be seen by rearranging the above:
+$$\log\left(\frac{p_i}{1 - p_i}\right) = \mathbf{X}\boldsymbol{\beta} = \beta_0 + \beta_1x_1 + ... + \beta_kx_k.$$
+That is, the slope coefficients denote the change in the natural log of the odds that some outcome equals 1.
+
+Unlike ordinary least squares regression, there is no closed form solution for recovering the parameters of interest. Instead, one must use an iterative numerical optimizer, an algorithm that searchers for the parameter values that maximize $L_\text{logit}$. Typically, when finding the values that optimize the objective function, we technically minimize the negative log of the likelihood function:
+$$-\sum_iy_i\log(p_i) - \sum_i(1 - y_i)\log(1 - p_i).$$
+
+The routine for doing this in R is straightforward:
+
+  1. First we need to create the logit link function.
+
+```{r create logit link}
+logit_link = function(x) exp(x)/(exp(x) + 1)
+```
+
+
+  2. Then we need to write a routine that returns the negative log likelihood for an outcome $y_i$ and a set of predictors and parameters to be estimated:
+  
+```{r create log likelihood}
+logit_fun = function(
+  y, # outcome variable
+  X, # matrix of k+1 predictors
+  b  # vector of parameters to be estimated
+) {
+  lp   = X%*%b # The linear predictor
+  p    = logit_link(lp) # The probability of an outcome being 1
+  llik = sum(y*log(p)) + sum((1-y)*log(1-p)) # The log-likelihood function
+  return(-llik) # Return the negative log-likelihood
+}
+```
+
+  3. Next, we write the routine that optimizes the negative log-likelihood `logit_fun`:
+  
+```{r logit optimizer}
+logit = function(
+  y, # outcome variable
+  X  # matrix of k predictors (and only k!)
+)  {
+  # use iterative numerical optimizer:
+  out = optim(
+    fn = logit_fun,  # specify logit function as objective function to be minimized
+    y  = y,          # include outcome values
+    X  = cbind(1,X), # include covariate matrix with constant
+    par = rep(0,len=ncol(X)+1), # set starting values for parameters
+    hessian = TRUE,  # generate a hessian matrix
+    method = "BFGS", # use BFGS algorithm
+    control = list(REPORT = 10, # specifications for optimization routine
+                   trace = 1, 
+                   maxit = 100000)
+  )
+  
+  # Estimate the variance-covariance matrix
+  vcov = try(as.matrix(solve(out$hessian, 
+                             tol=1e-24)), T)
+  
+  # Create summary of output
+  sum = data.frame(
+    # Variable names
+    term = c('(Intercept)',colnames(X)),
+    
+    # Parameter estimates
+    estimate=out$par,
+    
+    # Standard errors
+    std.error = sqrt(diag(vcov)),
+    
+    # Test statistics
+    statistic = out$par/sqrt(diag(vcov)),
+    
+    # p-values
+    p.value = round(2*pnorm(abs(out$par/
+                                  sqrt(diag(vcov))),
+                            lower.tail=FALSE),4)
+  )
+  
+  # Generate fitted values (useful for testing model fit)
+  fit = cbind(1,X)%*%sum$estimate[1:(ncol(X)+1)]
+  
+  # Return output
+  return(
+    list(
+      sum=sum,
+      fit=fit
+    )
+  )
+}
+```
+
+
+Let's take it for a test run, shall we?
+
+Make some fake voting data:
+
+```{r}
+library(tidyverse)
+tibble(
+  sex = rbinom(size=1,n=1000,.5), # simulate binomial indicator for female
+  age = round(runif(18,99,n=1000)), # simulate ages in years from 18 to 99
+  edu = round(runif(0,16,n=1000)), # simulate years of education
+  pty = rbinom(size=1,n=1000,.5), # simulate indicator for same party membership
+  vote = as.numeric(logit_link(.1 + .2*sex - .05*age + .3*edu + .95*pty + rnorm(n=1000))>.5)
+) -> vote_data
+summary(vote_data)
+```
+
+Next, estimate logit coefficients:
+
+```{r}
+logit_model = with(
+  vote_data, 
+  logit(y = vote, X = cbind(sex,age,edu,pty))
+)
+logit_model$sum
+```
+
+To check the results, let's compare with base R `glm` output:
+
+```{r}
+glm_logit_model = 
+  glm(vote ~ sex + age + edu + pty, data = vote_data, family = binomial)
+
+# open dotwhisker library to plot coefficients and 95% CIs
+library(dotwhisker)
+
+rbind(
+  broom::tidy(glm_logit_model) %>% mutate(model="base R"),
+  logit_model$sum %>% mutate(model="My version")
+) %>%
+  dwplot() + 
+  geom_vline(xintercept = 0) + 
+  theme_classic() + 
+  labs(
+    x = "Estimated Coefficient\n(95% CIs shown)",
+    color = ""
+  ) +
+  theme(
+    legend.position = c(.8,.8)
+  )
+```
+
+*The results are spot on!!!!*
+
+Now, let's turn to the probit model...
+
+# Probit
+I hate probit. I'll just say that right off the bat. It performs near identically to logit in terms of quality of predictions (there are only marginal differences in the slope of the logistic curve relative to the cumulative probability density curve which is fitted by probit), yet it lacks an intuitive interpretation like logit. That said, many people like it, and it is worthwhile to produce a routine that estimates a probit model, if only for the purpose of this exercise.
+
+The principle idea of probit is much the same as logit. In fact, the general form of the likelihood function for probit is *identical* to logit's:
+$$L_\text{probit} = \prod_ip_i^{y_i}(1-p_i)^{1-y_i}.$$
+The key difference is that probit relies on a different link function. Rather than specify the probability of an outcome being 1 as $\frac{\exp(\mathbf{X}\beta)}{\exp(\mathbf{X}\beta) + 1}$, the probit link function specifies
+$$p_i \equiv \Phi(\mathbf{X}\boldsymbol{\beta}).$$
+$\Phi(\codt)$ denotes the cumulative distribution function (this is the integral of the probability density function). If you want to know the actual form of this function, just look it up on a site like WolframAlpha. For our purposes, we can "cheat" by relying on `pnorm()`, a base r function for the cumulative distribution function.
+
+  1. First we need to create the probit link function.
+
+```{r create probit link}
+probit_link = function(x) pnorm(x)
+```
+
+
+  2. Then we need to write a routine that returns the negative log likelihood for an outcome $y_i$ and a set of predictors and parameters to be estimated:
+  
+```{r create log likelihood 2}
+probit_fun = function(
+  y, # outcome variable
+  X, # matrix of k+1 predictors
+  b  # vector of parameters to be estimated
+) {
+  lp   = X%*%b # The linear predictor
+  p    = probit_link(lp) # The probability of an outcome being 1
+  llik = sum(y*log(p)) + sum((1-y)*log(1-p)) # The log-likelihood function
+  return(-llik) # Return the negative log-likelihood
+}
+```
+
+  3. Next, we write the routine that optimizes the negative log-likelihood `probit_fun`:
+  
+```{r probit optimizer}
+probit = function(
+  y, # outcome variable
+  X  # matrix of k predictors (and only k!)
+)  {
+  # use iterative numerical optimizer:
+  out = optim(
+    fn = probit_fun,  # specify probit function as objective function to be minimized
+    y  = y,          # include outcome values
+    X  = cbind(1,X), # include covariate matrix with constant
+    par = rep(0,len=ncol(X)+1), # set starting values for parameters
+    hessian = TRUE,  # generate a hessian matrix
+    method = "BFGS", # use BFGS algorithm
+    control = list(REPORT = 10, # specifications for optimization routine
+                   trace = 1, 
+                   maxit = 100000)
+  )
+  
+  # Estimate the variance-covariance matrix
+  vcov = try(as.matrix(solve(out$hessian, 
+                             tol=1e-24)), T)
+  
+  # Create summary of output
+  sum = data.frame(
+    # Variable names
+    term = c('(Intercept)',colnames(X)),
+    
+    # Parameter estimates
+    estimate=out$par,
+    
+    # Standard errors
+    std.error = sqrt(diag(vcov)),
+    
+    # Test statistics
+    statistic = out$par/sqrt(diag(vcov)),
+    
+    # p-values
+    p.value = round(2*pnorm(abs(out$par/
+                                  sqrt(diag(vcov))),
+                            lower.tail=FALSE),4)
+  )
+  
+  # Generate fitted values (useful for testing model fit)
+  fit = cbind(1,X)%*%sum$estimate[1:(ncol(X)+1)]
+  
+  # Return output
+  return(
+    list(
+      sum=sum,
+      fit=fit
+    )
+  )
+}
+```
+
+
+Let's use the same fake voting data that we used for logit...
+
+First, estimate model parameters with our new probit function:
+
+```{r}
+probit_model = 
+  with(
+    vote_data,
+    probit(y = vote, X = cbind(sex, age, edu, pty))
+  )
+probit_model$sum
+```
+
+Let's compare this to base R:
+
+```{r}
+glm_probit_model = 
+  glm(vote ~ sex + age + edu + pty, data = vote_data, family = binomial(link="probit"))
+
+rbind(
+  broom::tidy(glm_probit_model) %>% mutate(model="base R"),
+  probit_model$sum %>% mutate(model="My version")
+) %>%
+  dwplot() + 
+  geom_vline(xintercept = 0) + 
+  theme_classic() + 
+  labs(
+    x = "Estimated Coefficient\n(95% CIs shown)",
+    color = ""
+  ) +
+  theme(
+    legend.position = c(.8,.8)
+  )
+```
+
+*We've done it again!!!*
